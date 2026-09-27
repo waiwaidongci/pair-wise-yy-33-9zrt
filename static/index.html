@@ -1,1 +1,136 @@
-<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>电网恢复调度</title><style>body{font:16px system-ui;max-width:1100px;margin:32px auto;padding:0 20px}pre{background:#f3f5f7;padding:16px;overflow:auto}button{padding:8px 14px}</style><h1>电网事故应急与恢复调度</h1><p>停运事件、安全约束恢复计划、重要用户、离线上报合并、异常遥测隔离和状态发布。</p><button onclick="loadState()">刷新状态</button><pre id="state">加载中...</pre><script>async function loadState(){state.textContent=JSON.stringify(await (await fetch('/api/state')).json(),null,2)}loadState()</script></html>
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<title>电网恢复调度</title>
+<style>
+body{font:15px system-ui;margin:24px auto;max-width:1180px;padding:0 20px;color:#1f2933}
+h1{font-size:22px}h2{font-size:17px;margin-top:28px}
+button{padding:6px 12px;cursor:pointer}
+select,input{padding:5px 8px;font:inherit}
+table{border-collapse:collapse;width:100%;margin:10px 0}
+th,td{border:1px solid #d6dbe1;padding:7px 9px;text-align:left;vertical-align:top;font-size:13px}
+th{background:#f3f5f7}
+.ok{color:#1a7f37;font-weight:600}.bad{color:#c0392b;font-weight:600}.warn{color:#b7791f;font-weight:600}
+.gap{color:#c0392b;margin:2px 0}.muted{color:#6b7280}
+pre{background:#f3f5f7;padding:12px;overflow:auto;max-height:340px}
+.bar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:10px 0}
+.rowform{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
+</style>
+<h1>电网事故应急与恢复调度</h1>
+<p>停运事件、安全约束恢复计划、重要用户备用电源检查、离线上报合并、异常遥测隔离和状态发布。</p>
+
+<div class="bar">
+  <label>计划：<select id="planSel" onchange="loadPlan()"></select></label>
+  <button onclick="loadState();loadPlan()">刷新</button>
+</div>
+
+<h2>恢复步骤与备用电源余量</h2>
+<div id="planMeta" class="muted"></div>
+<table id="stepsTable"><thead><tr>
+  <th>步骤</th><th>动作／资产</th><th>保供用户</th><th>用电需求MW</th>
+  <th>备用余量MW</th><th>剩余时间(分)</th><th>截止时间</th><th>判定</th><th>卡住原因</th>
+</tr></thead><tbody></tbody></table>
+
+<h2>步骤确认</h2>
+<table id="confTable"><thead><tr><th>步骤</th><th>结论</th><th>确认人</th><th>时刻</th><th>检查依据</th><th>有效性</th></tr></thead><tbody></tbody></table>
+
+<h2>现场报告（检查不过时只保留缺口说明）</h2>
+<table id="reportTable"><thead><tr><th>#</th><th>步骤</th><th>状态</th><th>合并</th><th>备注</th><th>备用电源缺口</th></tr></thead><tbody></tbody></table>
+
+<h2>登记备用电源检查（调度员）</h2>
+<div class="rowform">
+  步骤<input id="chkStep" type="number" min="1" style="width:70px">
+  检查时刻<input id="chkAt" placeholder="2026-09-27T10:00:00Z" style="width:210px">
+  可持续(分)<input id="chkMin" type="number" style="width:80px" value="120">
+  备用MW<input id="chkBak" type="number" style="width:80px">
+  需求MW<input id="chkDemand" type="number" style="width:80px" placeholder="留空取步骤需求">
+  <button onclick="registerCheck()">登记检查</button>
+  <button onclick="updateDemand()">仅更新需求</button>
+</div>
+<div id="msg" class="muted"></div>
+
+<h2>状态快照</h2>
+<pre id="state">加载中...</pre>
+
+<script>
+let plans = [];
+const esc = s => String(s ?? "").replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+const cls = v => v === 'ok' ? 'ok' : v === 'stale' ? 'warn' : 'bad';
+const label = {ok:'有效', missing:'未检查', expired:'已失效', insufficient:'余量不足', stale:'确认失效'};
+
+async function api(path, body, method='POST'){
+  const opt = {method, headers:{'Content-Type':'application/json','X-Actor':'dispatcher-demo','X-Role':'dispatcher'}};
+  if (body) opt.body = JSON.stringify(body);
+  const r = await fetch(path, opt); return {status:r.status, json: await r.json()};
+}
+function show(msg, bad=false){msgEl.textContent = msg; msgEl.className = bad ? 'bad' : 'ok';}
+
+async function loadState(){
+  const s = await (await fetch('/api/state')).json();
+  state.textContent = JSON.stringify(s, null, 2);
+  plans = (s.plans||[]).slice().reverse();
+  const sel = planSel, cur = sel.value;
+  sel.innerHTML = plans.map(p => `<option value="${p.id}">#${p.id} v${p.version} ${p.state}（事故${p.outage_id}）</option>`).join('');
+  if (cur) sel.value = cur;
+}
+
+async function loadPlan(){
+  const id = planSel.value;
+  if (!id) return;
+  const d = (await (await fetch('/api/plans/'+id)).json());
+  if (d.error){show(d.error,true);return;}
+  planMeta.textContent = `计划 #${d.plan.id} 版本 v${d.plan.version} 状态 ${d.plan.state}`;
+  const facilities = {}; // 页面只展示 facility_id，名称可从 state 补
+  const facMap = Object.fromEntries((window._fac||[]).map(f=>[f.id,f.name]));
+  stepsTable.querySelector('tbody').innerHTML = d.step_pages.map(sp => {
+    const step = d.plan.steps.find(x=>x.seq===sp.seq);
+    const b = sp.backup || {};
+    const verdict = sp.facility_id
+      ? `<span class="${cls(b.state)}">${label[b.state]||b.state}</span>`
+      : '<span class="muted">非保供步骤</span>';
+    const margin = sp.facility_id && b.margin_mw != null
+      ? `<span class="${b.margin_mw >= 0 ? 'ok':'bad'}">${b.margin_mw}</span>` : '<span class="muted">—</span>';
+    const left = sp.facility_id && b.remaining_minutes != null
+      ? `<span class="${b.remaining_minutes >= 0 ? 'ok':'bad'}">${b.remaining_minutes}</span>` : '<span class="muted">—</span>';
+    const stuck = (sp.stuck_reasons||[]).map(r=>`<div class="gap">${esc(r)}</div>`).join('') || '<span class="ok">无</span>';
+    return `<tr><td>${sp.seq}</td><td>${esc(step.action)} / ${esc(step.asset)}</td>
+      <td>${sp.facility_id ? '#'+sp.facility_id+' '+(facMap[sp.facility_id]||'') : '—'}</td>
+      <td>${sp.required_mw}</td><td>${margin}</td><td>${left}</td><td>${b.deadline||'—'}</td>
+      <td>${verdict}${(b.reasons||[]).map(r=>`<div class="gap">${esc(r)}</div>`).join('')}</td>
+      <td>${stuck}</td></tr>`;
+  }).join('');
+  confTable.querySelector('tbody').innerHTML = d.confirmations.map(c =>
+    `<tr><td>${c.step_no}</td><td>${c.status}</td><td>${esc(c.confirmed_by)}</td><td>${c.confirmed_at}</td>
+     <td>${c.backup_check_id ? '#'+c.backup_check_id : '—'}</td>
+     <td>${c.effective ? '<span class="ok">有效</span>' : '<span class="warn">失效：'+esc(c.stale_reason)+'</span>'}</td></tr>`).join('')
+     || '<tr><td colspan="6" class="muted">暂无确认</td></tr>';
+  reportTable.querySelector('tbody').innerHTML = d.field_reports.map(r =>
+    `<tr><td>${r.id}</td><td>${r.step_no}</td><td>${r.status}</td><td>${r.merge_status}${r.conflict_reason?'：'+esc(r.conflict_reason):''}</td>
+     <td>${esc(r.note)}</td><td>${(r.backup_gap||[]).map(g=>`<div class="gap">${esc(g)}</div>`).join('')||'—'}</td></tr>`).join('')
+     || '<tr><td colspan="6" class="muted">暂无现场报告</td></tr>';
+  if (!chkStep.value && d.plan.steps.length) chkStep.value = d.plan.steps[0].seq;
+}
+
+async function registerCheck(){
+  const id = planSel.value;
+  const body = {step_no:+chkStep.value, checked_at:chkAt.value, sustainable_minutes:+chkMin.value,
+                backup_mw:+chkBak.value};
+  if (chkDemand.value !== '') body.demand_mw = +chkDemand.value;
+  const r = await api(`/api/plans/${id}/backup-checks`, body);
+  if (r.json.error) return show(r.json.error, true);
+  show('已登记检查 #'+r.json.id+'，截止 '+r.json.deadline); await loadPlan();
+}
+async function updateDemand(){
+  const id = planSel.value;
+  const r = await api(`/api/plans/${id}/backup-demand`, {step_no:+chkStep.value, demand_mw:+chkDemand.value});
+  if (r.json.error) return show(r.json.error, true);
+  show('用电需求已更新，原确认需重新核验'); await loadPlan();
+}
+async function boot(){
+  await loadState();
+  const s = JSON.parse(state.textContent); window._fac = s.facilities||[];
+  if (plans.length){planSel.value = plans[0].id; await loadPlan();}
+}
+boot();
+</script>
+</html>

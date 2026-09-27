@@ -11,6 +11,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
+import backup as backup_rules
+from backup import STATE_OK
+
 DB_PATH = Path(__file__).with_name("data.db")
 
 
@@ -60,8 +63,18 @@ class Store:
         CREATE TABLE IF NOT EXISTS confirmations (
           id INTEGER PRIMARY KEY AUTOINCREMENT, plan_id INTEGER NOT NULL REFERENCES plans(id), step_no INTEGER NOT NULL,
           status TEXT NOT NULL CHECK(status IN ('confirmed','blocked')), confirmed_by TEXT NOT NULL, confirmed_at TEXT NOT NULL,
-          note TEXT, UNIQUE(plan_id,step_no)
+          note TEXT,
+          backup_check_id INTEGER REFERENCES backup_checks(id), demand_mw_snapshot REAL,
+          UNIQUE(plan_id,step_no)
         );
+        CREATE TABLE IF NOT EXISTS backup_checks (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, plan_id INTEGER NOT NULL REFERENCES plans(id),
+          step_no INTEGER NOT NULL, revision_kind TEXT NOT NULL CHECK(revision_kind IN ('check','demand')),
+          checked_at TEXT NOT NULL, sustainable_minutes INTEGER NOT NULL, deadline TEXT NOT NULL,
+          backup_mw REAL NOT NULL, demand_mw REAL NOT NULL,
+          checked_by TEXT NOT NULL, created_at TEXT NOT NULL, note TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_backup_checks_step ON backup_checks(plan_id,step_no,id);
         CREATE TABLE IF NOT EXISTS field_reports (
           id INTEGER PRIMARY KEY AUTOINCREMENT, client_report_id TEXT UNIQUE NOT NULL, plan_id INTEGER NOT NULL REFERENCES plans(id),
           step_no INTEGER NOT NULL, expected_plan_version INTEGER NOT NULL, status TEXT NOT NULL,
@@ -82,6 +95,10 @@ class Store:
           entity_type TEXT NOT NULL, entity_id TEXT NOT NULL, details_json TEXT NOT NULL
         );
         """)
+        for col, decl in (("backup_check_id", "INTEGER"), ("demand_mw_snapshot", "REAL")):
+            have = self.conn.execute("PRAGMA table_info(confirmations)").fetchall()
+            if col not in {row["name"] for row in have}:
+                self.conn.execute(f"ALTER TABLE confirmations ADD COLUMN {col} {decl}")
         self.conn.commit()
 
     def audit(self, actor: str, action: str, entity_type: str, entity_id: object, details: dict) -> None:
@@ -230,7 +247,107 @@ class GridService:
             if merge_status == "merged" and status in {"completed", "blocked"}:
                 self.store.audit(actor, "field_report.merged", "plan", plan_id, {"step_no": step_no, "status": status, "client_report_id": client_report_id})
             self.store.audit(actor, "field_report.received", "plan", plan_id, {"step_no": step_no, "merge_status": merge_status, "conflict": conflict})
-        return dict(self._row("field_reports", cur.lastrowid))
+        result = dict(self._row("field_reports", cur.lastrowid))
+        # 保供步骤的现场报告只留缺口说明，不能替代备用电源检查
+        if merge_status == "merged" and steps[step_no].get("facility_id"):
+            gap = self._backup_gap(steps[step_no], plan_id, step_no, now())
+            result["backup_gap"] = None if gap.valid else gap.reasons
+        return result
+
+    # ---------- 备用电源检查（检查记录层） ----------
+
+    def register_backup_check(self, actor: str | None, role: str | None, plan_id: int, step_no: int,
+                              checked_at: str, sustainable_minutes: int, backup_mw: float,
+                              demand_mw: float | None = None, note: str = "") -> dict:
+        """调度员登记一次备用电源检查：检查时刻、可持续时长、截止时间、备用容量和用电需求。
+
+        每次登记产生新版本记录；新版本会使该步骤上依据旧检查的确认失效（在判定层动态核验）。
+        """
+        actor = self._actor(actor, role, {"dispatcher"})
+        step, plan = self._facility_step(plan_id, step_no)
+        try:
+            deadline = backup_rules.compute_deadline(checked_at, int(sustainable_minutes))
+        except ValueError as exc: raise ApiError(400, str(exc)) from exc
+        if float(backup_mw) < 0: raise ApiError(400, "备用可用容量不能为负")
+        demand = float(demand_mw) if demand_mw is not None else float(step["required_mw"])
+        if demand < 0: raise ApiError(400, "用电需求不能为负")
+        with self.conn:
+            cur = self.conn.execute("""INSERT INTO backup_checks(plan_id,step_no,revision_kind,checked_at,sustainable_minutes,
+                                     deadline,backup_mw,demand_mw,checked_by,created_at,note)
+                                     VALUES(?,?, 'check',?,?,?,?,?,?,?,?)""",
+                                    (plan_id, step_no, checked_at, int(sustainable_minutes), deadline,
+                                     float(backup_mw), demand, actor, now(), note))
+            self.store.audit(actor, "backup_check.register", "plan", plan_id,
+                             {"step_no": step_no, "facility_id": step["facility_id"], "deadline": deadline,
+                              "backup_mw": backup_mw, "demand_mw": demand, "backup_check_id": cur.lastrowid})
+        record = dict(self._row("backup_checks", cur.lastrowid))
+        record["verdict"] = backup_rules.evaluate(deadline=deadline, backup_mw=backup_mw,
+                                                  demand_mw=demand, at=now()).as_dict()
+        return record
+
+    def update_backup_demand(self, actor: str | None, role: str | None, plan_id: int, step_no: int,
+                             demand_mw: float, note: str = "") -> dict:
+        """用电需求更新：沿用最近一次检查的容量与截止时间，追加新版本记录。
+
+        需求变化后原确认失效，需要重新核验。
+        """
+        actor = self._actor(actor, role, {"dispatcher"})
+        step, plan = self._facility_step(plan_id, step_no)
+        latest = self._latest_check(plan_id, step_no)
+        if not latest: raise ApiError(409, "该步骤尚未登记备用电源检查，无法单独更新用电需求")
+        if float(demand_mw) < 0: raise ApiError(400, "用电需求不能为负")
+        with self.conn:
+            cur = self.conn.execute("""INSERT INTO backup_checks(plan_id,step_no,revision_kind,checked_at,sustainable_minutes,
+                                     deadline,backup_mw,demand_mw,checked_by,created_at,note)
+                                     VALUES(?,?, 'demand',?,?,?,?,?,?,?,?)""",
+                                    (plan_id, step_no, latest["checked_at"], latest["sustainable_minutes"],
+                                     latest["deadline"], latest["backup_mw"], float(demand_mw), actor, now(), note))
+            self.store.audit(actor, "backup_check.demand_update", "plan", plan_id,
+                             {"step_no": step_no, "facility_id": step["facility_id"],
+                              "demand_mw": demand_mw, "old_demand_mw": latest["demand_mw"],
+                              "backup_check_id": cur.lastrowid})
+        record = dict(self._row("backup_checks", cur.lastrowid))
+        record["verdict"] = backup_rules.evaluate(deadline=latest["deadline"], backup_mw=latest["backup_mw"],
+                                                  demand_mw=float(demand_mw), at=now()).as_dict()
+        return record
+
+    def _facility_step(self, plan_id: int, step_no: int) -> tuple[dict, sqlite3.Row]:
+        plan = self._row("plans", plan_id)
+        steps = {int(x["seq"]): x for x in json.loads(plan["steps_json"])}
+        if step_no not in steps: raise ApiError(400, "计划中没有该步骤")
+        step = steps[step_no]
+        if not step.get("facility_id"): raise ApiError(400, "该步骤不是重要用户保供步骤，无需备用电源检查")
+        return step, plan
+
+    def _latest_check(self, plan_id: int, step_no: int) -> sqlite3.Row | None:
+        return self.conn.execute("SELECT * FROM backup_checks WHERE plan_id=? AND step_no=? ORDER BY id DESC LIMIT 1",
+                                 (plan_id, step_no)).fetchone()
+
+    def _backup_gap(self, step: dict, plan_id: int, step_no: int, at: str) -> backup_rules.BackupVerdict:
+        """判定层：返回某保供步骤当前的备用电源缺口判定。"""
+        if not step.get("facility_id"):
+            return backup_rules.BackupVerdict(STATE_OK, True, reasons=[])
+        latest = self._latest_check(plan_id, step_no)
+        if not latest:
+            return backup_rules.missing()
+        return backup_rules.evaluate(deadline=latest["deadline"], backup_mw=latest["backup_mw"],
+                                     demand_mw=latest["demand_mw"], at=at)
+
+    def _confirmation_effect(self, row: sqlite3.Row, steps: dict[int, dict], at: str) -> tuple[bool, str | None]:
+        """判定层：确认是否仍然有效。检查结果或用电需求更新后，原确认失效需要重新核验。"""
+        if row["status"] != "confirmed" or row["backup_check_id"] is None:
+            return True, None
+        step_no = int(row["step_no"]); current = self._latest_check(row["plan_id"], step_no)
+        if current is None:
+            return False, "备用电源检查记录已不存在"
+        if int(current["id"]) != int(row["backup_check_id"]):
+            label = "检查结果" if current["revision_kind"] == "check" else "用电需求"
+            return False, f"{label}已更新，原确认失效，需要重新核验"
+        verdict = backup_rules.evaluate(deadline=current["deadline"], backup_mw=current["backup_mw"],
+                                        demand_mw=current["demand_mw"], at=at)
+        if not verdict.valid:
+            return False, verdict.reasons[0]
+        return True, None
 
     def confirm_step(self, actor: str | None, role: str | None, plan_id: int, step_no: int, decision: str, note: str = "") -> dict:
         actor = self._actor(actor, role, {"dispatcher"})
@@ -245,11 +362,20 @@ class GridService:
         for dependency in steps[step_no].get("depends_on", []):
             found = self.conn.execute("SELECT * FROM confirmations WHERE plan_id=? AND step_no=? AND status='confirmed'", (plan_id, int(dependency))).fetchone()
             if not found: raise ApiError(409, f"前置步骤 {dependency} 尚未确认")
+        # 保供步骤必须有有效且余量充足的备用电源检查；现场报告不能替代检查
+        gap = self._backup_gap(steps[step_no], plan_id, step_no, now())
+        latest_check = self._latest_check(plan_id, step_no) if steps[step_no].get("facility_id") else None
+        if decision == "confirmed" and not gap.valid:
+            raise ApiError(409, "；".join(gap.reasons))
         with self.conn:
-            self.conn.execute("""INSERT INTO confirmations(plan_id,step_no,status,confirmed_by,confirmed_at,note) VALUES(?,?,?,?,?,?)
-                               ON CONFLICT(plan_id,step_no) DO UPDATE SET status=excluded.status,confirmed_by=excluded.confirmed_by,confirmed_at=excluded.confirmed_at,note=excluded.note""",
-                              (plan_id, step_no, decision, actor, now(), note))
-            self.store.audit(actor, "plan.confirm_step", "plan", plan_id, {"step_no": step_no, "status": decision, "note": note})
+            self.conn.execute("""INSERT INTO confirmations(plan_id,step_no,status,confirmed_by,confirmed_at,note,backup_check_id,demand_mw_snapshot) VALUES(?,?,?,?,?,?,?,?)
+                               ON CONFLICT(plan_id,step_no) DO UPDATE SET status=excluded.status,confirmed_by=excluded.confirmed_by,confirmed_at=excluded.confirmed_at,note=excluded.note,backup_check_id=excluded.backup_check_id,demand_mw_snapshot=excluded.demand_mw_snapshot""",
+                              (plan_id, step_no, decision, actor, now(), note,
+                               latest_check["id"] if latest_check else None,
+                               float(latest_check["demand_mw"]) if latest_check else None))
+            self.store.audit(actor, "plan.confirm_step", "plan", plan_id,
+                            {"step_no": step_no, "status": decision, "note": note,
+                             "backup_gap": None if gap.valid else gap.reasons})
         return dict(self.conn.execute("SELECT * FROM confirmations WHERE plan_id=? AND step_no=?", (plan_id, step_no)).fetchone())
 
     def publish_status(self, actor: str | None, role: str | None, outage_id: int, plan_id: int) -> dict:
@@ -257,11 +383,46 @@ class GridService:
         plan = self._row("plans", plan_id); outage = self._row("outages", outage_id)
         if plan["outage_id"] != outage_id: raise ApiError(400, "计划不属于该事故")
         confirmations = {row["step_no"]: dict(row) for row in self.conn.execute("SELECT * FROM confirmations WHERE plan_id=?", (plan_id,))}
-        steps = json.loads(plan["steps_json"])
-        completed = sum(1 for step in steps if confirmations.get(int(step["seq"]), {}).get("status") == "confirmed")
+        steps = json.loads(plan["steps_json"]); steps_by_seq = {int(s["seq"]): s for s in steps}
+        at = now()
+        blocked: list[str] = []
+
+        def confirmed_effective(seq: int) -> bool:
+            row = confirmations.get(seq)
+            if not row or row.get("status") != "confirmed": return False
+            row = self.conn.execute("SELECT * FROM confirmations WHERE plan_id=? AND step_no=?", (plan_id, seq)).fetchone()
+            effective, _ = self._confirmation_effect(row, steps_by_seq, at)
+            return effective
+
+        completed = sum(1 for step in steps if confirmed_effective(int(step["seq"])))
+        all_done = completed == len(steps)
+
+        # 发布恢复完成前：受影响区域的每个重要用户都要有有效检查
+        if all_done:
+            affected = set(json.loads(outage["affected_regions_json"]))
+            facilities = [dict(r) for r in self.conn.execute("SELECT * FROM facilities WHERE connected=1 ORDER BY id")]
+            covered_facilities: set[int] = set()
+            for step in steps:
+                fid = step.get("facility_id")
+                if fid: covered_facilities.add(int(fid))
+            for facility in facilities:
+                asset = self._row("assets", facility["asset_id"])
+                if asset["region"] not in affected: continue
+                fid = int(facility["id"])
+                if fid not in covered_facilities:
+                    blocked.append(f"受影响重要用户「{facility['name']}」没有对应的保供步骤和备用电源检查")
+                    continue
+                step_no = next(int(s["seq"]) for s in steps if int(s["facility_id"]) == fid)
+                gap = self._backup_gap(steps_by_seq[step_no], plan_id, step_no, at)
+                if not gap.valid:
+                    blocked.extend([f"重要用户「{facility['name']}」步骤 {step_no}：{r}" for r in gap.reasons])
+            if blocked:
+                raise ApiError(409, "恢复完成发布被阻止：" + "；".join(blocked))
+
         status = {"outage_id": outage_id, "incident_code": outage["incident_code"], "plan_id": plan_id, "plan_version": plan["version"],
-                  "state": "restored" if completed == len(steps) else "restoring", "completed_steps": completed, "total_steps": len(steps),
-                  "critical_blocked": [x for x in confirmations.values() if x["status"] == "blocked"]}
+                  "state": "restored" if all_done else "restoring", "completed_steps": completed, "total_steps": len(steps),
+                  "critical_blocked": [x for x in confirmations.values() if x["status"] == "blocked"],
+                  "backup_blocked": blocked}
         with self.conn:
             cur = self.conn.execute("INSERT INTO published_status(outage_id,plan_id,version,status_json,created_at) VALUES(?,?,?,?,?)",
                                     (outage_id, plan_id, plan["version"], j(status), now()))
@@ -280,10 +441,17 @@ class GridService:
             asset = self.conn.execute("SELECT * FROM assets WHERE code=?", (asset_code,)).fetchone()
             if not asset: raise ApiError(400, f"步骤资产不存在：{asset_code}")
             if required > float(asset["capacity_mw"]): raise ApiError(409, f"步骤 {seq} 超过资产安全容量")
+            facility_id = raw.get("facility_id")
+            if facility_id is not None:
+                facility_id = int(facility_id)
+                facility = self.conn.execute("SELECT * FROM facilities WHERE id=?", (facility_id,)).fetchone()
+                if not facility: raise ApiError(400, f"步骤 {seq} 关联的重要用户不存在")
+                if int(facility["asset_id"]) != int(asset["id"]): raise ApiError(400, f"步骤 {seq} 保供的重要用户不属于步骤资产")
             deps = [int(x) for x in raw.get("depends_on", [])]
             if any(dep >= seq for dep in deps): raise ApiError(400, "依赖步骤必须位于当前步骤之前")
             seqs.add(seq); normalized.append({"seq": seq, "action": str(raw.get("action", "energize")), "asset": asset_code,
-                                                  "required_mw": required, "depends_on": deps, "critical": bool(raw.get("critical", False))})
+                                                  "required_mw": required, "depends_on": deps, "critical": bool(raw.get("critical", False)),
+                                                  "facility_id": facility_id})
         available = {row["seq"]: set(row["depends_on"]) for row in normalized}
         for seq, deps in available.items():
             if not deps.issubset(seqs): raise ApiError(400, f"步骤 {seq} 含有未知依赖")
@@ -299,8 +467,23 @@ class GridService:
             seq = int(step["seq"])
             if seq in confirmed:
                 old = confirmed[seq]
-                self.conn.execute("INSERT INTO confirmations(plan_id,step_no,status,confirmed_by,confirmed_at,note) VALUES(?,?,?,?,?,?)",
-                                  (new_plan_id, seq, old["status"], old["confirmed_by"], old["confirmed_at"], old["note"]))
+                new_check_id = self._copy_latest_backup_check(old_plan_id, new_plan_id, seq)
+                self.conn.execute("""INSERT INTO confirmations(plan_id,step_no,status,confirmed_by,confirmed_at,note,backup_check_id,demand_mw_snapshot)
+                                     VALUES(?,?,?,?,?,?,?,?)""",
+                                  (new_plan_id, seq, old["status"], old["confirmed_by"], old["confirmed_at"], old["note"],
+                                   new_check_id, old["demand_mw_snapshot"]))
+
+    def _copy_latest_backup_check(self, old_plan_id: int, new_plan_id: int, step_no: int) -> int | None:
+        latest = self._latest_check(old_plan_id, step_no)
+        if not latest:
+            return None
+        cur = self.conn.execute("""INSERT INTO backup_checks(plan_id,step_no,revision_kind,checked_at,sustainable_minutes,
+                                 deadline,backup_mw,demand_mw,checked_by,created_at,note)
+                                 VALUES(?,?, 'check',?,?,?,?,?,?,?,?)""",
+                                (new_plan_id, step_no, latest["checked_at"], latest["sustainable_minutes"],
+                                 latest["deadline"], latest["backup_mw"], latest["demand_mw"],
+                                 latest["checked_by"], now(), latest["note"]))
+        return int(cur.lastrowid)
 
     def _plan_update(self, plan: sqlite3.Row, state: str, expected_revision: int, actor: str, action: str, details: dict) -> None:
         if int(expected_revision) != int(plan["revision"]): raise ApiError(409, "计划版本冲突")
@@ -311,8 +494,49 @@ class GridService:
 
     def plan_detail(self, plan_id: int) -> dict:
         plan = self._plan_dict(self._row("plans", plan_id))
-        return {"plan": plan, "confirmations": [dict(row) for row in self.conn.execute("SELECT * FROM confirmations WHERE plan_id=? ORDER BY step_no", (plan_id,))],
-                "field_reports": [dict(row) for row in self.conn.execute("SELECT * FROM field_reports WHERE plan_id=? ORDER BY id", (plan_id,))]}
+        at = now()
+        steps_by_seq = {int(step["seq"]): step for step in plan["steps"]}
+        confirmations = [dict(row) for row in self.conn.execute("SELECT * FROM confirmations WHERE plan_id=? ORDER BY step_no", (plan_id,))]
+        reports = [dict(row) for row in self.conn.execute("SELECT * FROM field_reports WHERE plan_id=? ORDER BY id", (plan_id,))]
+        confirmation_by_step = {int(row["step_no"]): row for row in
+                                self.conn.execute("SELECT * FROM confirmations WHERE plan_id=?", (plan_id,))}
+
+        # 计划页层：把检查记录经判定层换算为每步余量和卡住原因
+        step_pages = []
+        for step in plan["steps"]:
+            seq = int(step["seq"])
+            gap = self._backup_gap(step, plan_id, seq, at)
+            latest = self._latest_check(plan_id, seq) if step.get("facility_id") else None
+            stuck: list[str] = []
+            if step.get("facility_id"):
+                if not gap.valid:
+                    stuck.extend(gap.reasons)
+                confirmation = confirmation_by_step.get(seq)
+                if confirmation is not None:
+                    effective, stale_reason = self._confirmation_effect(confirmation, steps_by_seq, at)
+                    if not effective:
+                        stuck.append(f"原确认已失效：{stale_reason}")
+            step_pages.append({"seq": seq, "facility_id": step.get("facility_id"),
+                               "required_mw": step["required_mw"], "backup": gap.as_dict(),
+                               "backup_check_id": latest["id"] if latest else None,
+                               "stuck_reasons": stuck, "can_confirm": not stuck})
+
+        for row in confirmations:
+            if row["backup_check_id"] is not None:
+                effective, stale_reason = self._confirmation_effect(
+                    self.conn.execute("SELECT * FROM confirmations WHERE id=?", (row["id"],)).fetchone(), steps_by_seq, at)
+                row["effective"] = effective
+                row["stale_reason"] = stale_reason
+            else:
+                row["effective"] = True
+                row["stale_reason"] = None
+        for report in reports:
+            step = steps_by_seq.get(int(report["step_no"]))
+            if step and step.get("facility_id") and report["merge_status"] == "merged":
+                gap = self._backup_gap(step, plan_id, int(report["step_no"]), at)
+                report["backup_gap"] = None if gap.valid else gap.reasons
+
+        return {"plan": plan, "confirmations": confirmations, "field_reports": reports, "step_pages": step_pages}
 
     def _outage_dict(self, row: sqlite3.Row) -> dict:
         return {"id": row["id"], "incident_code": row["incident_code"], "title": row["title"], "state": row["state"],
@@ -376,6 +600,8 @@ class Handler(BaseHTTPRequestHandler):
             elif len(p) == 4 and p[:2] == ["api", "plans"] and p[3] == "change": out = self.service.make_plan_change(actor, role, int(p[2]), b.get("steps", []), int(b.get("expected_revision", -1)))
             elif p == ["api", "field-reports"]: out = self.service.field_report(actor, role, int(b.get("plan_id", 0)), int(b.get("step_no", 0)), b.get("client_report_id", ""), int(b.get("expected_plan_version", 0)), b.get("status", ""), b.get("note", ""))
             elif len(p) == 4 and p[:2] == ["api", "plans"] and p[3] == "confirm": out = self.service.confirm_step(actor, role, int(p[2]), int(b.get("step_no", 0)), b.get("decision", "confirmed"), b.get("note", ""))
+            elif len(p) == 4 and p[:2] == ["api", "plans"] and p[3] == "backup-checks": out = self.service.register_backup_check(actor, role, int(p[2]), int(b.get("step_no", 0)), b.get("checked_at", ""), int(b.get("sustainable_minutes", 0)), float(b.get("backup_mw", 0)), b.get("demand_mw"), b.get("note", ""))
+            elif len(p) == 4 and p[:2] == ["api", "plans"] and p[3] == "backup-demand": out = self.service.update_backup_demand(actor, role, int(p[2]), int(b.get("step_no", 0)), float(b.get("demand_mw", 0)), b.get("note", ""))
             elif p == ["api", "status"]: out = self.service.publish_status(actor, role, int(b.get("outage_id", 0)), int(b.get("plan_id", 0)))
             else: raise ApiError(404, "接口不存在")
             self._send(200, out)
