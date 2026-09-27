@@ -6,7 +6,7 @@ import argparse
 import json
 import sqlite3
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
@@ -20,6 +20,19 @@ def now() -> str:
 
 def j(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True)
+
+
+def iso(moment: datetime) -> str:
+    return moment.astimezone(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def parse_time(value: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ApiError(400, "时间格式不合法") from exc
+    if parsed.tzinfo is None: parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 class ApiError(Exception):
@@ -42,7 +55,7 @@ class Store:
         CREATE TABLE IF NOT EXISTS facilities (
           id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, facility_type TEXT NOT NULL,
           asset_id INTEGER NOT NULL REFERENCES assets(id), priority INTEGER NOT NULL, backup_power_mw REAL NOT NULL,
-          connected INTEGER NOT NULL DEFAULT 1
+          demand_mw REAL NOT NULL DEFAULT 0, connected INTEGER NOT NULL DEFAULT 1
         );
         CREATE TABLE IF NOT EXISTS outages (
           id INTEGER PRIMARY KEY AUTOINCREMENT, incident_code TEXT UNIQUE NOT NULL, title TEXT NOT NULL,
@@ -60,7 +73,13 @@ class Store:
         CREATE TABLE IF NOT EXISTS confirmations (
           id INTEGER PRIMARY KEY AUTOINCREMENT, plan_id INTEGER NOT NULL REFERENCES plans(id), step_no INTEGER NOT NULL,
           status TEXT NOT NULL CHECK(status IN ('confirmed','blocked')), confirmed_by TEXT NOT NULL, confirmed_at TEXT NOT NULL,
-          note TEXT, UNIQUE(plan_id,step_no)
+          note TEXT, valid INTEGER NOT NULL DEFAULT 1, UNIQUE(plan_id,step_no)
+        );
+        CREATE TABLE IF NOT EXISTS backup_checks (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, facility_id INTEGER NOT NULL REFERENCES facilities(id),
+          outage_id INTEGER NOT NULL REFERENCES outages(id), checked_at TEXT NOT NULL,
+          sustain_minutes INTEGER NOT NULL, valid_until TEXT NOT NULL,
+          recorded_by TEXT NOT NULL, created_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS field_reports (
           id INTEGER PRIMARY KEY AUTOINCREMENT, client_report_id TEXT UNIQUE NOT NULL, plan_id INTEGER NOT NULL REFERENCES plans(id),
@@ -82,7 +101,16 @@ class Store:
           entity_type TEXT NOT NULL, entity_id TEXT NOT NULL, details_json TEXT NOT NULL
         );
         """)
+        self._migrate()
         self.conn.commit()
+
+    def _migrate(self) -> None:
+        facility_cols = {row[1] for row in self.conn.execute("PRAGMA table_info(facilities)")}
+        if "demand_mw" not in facility_cols:
+            self.conn.execute("ALTER TABLE facilities ADD COLUMN demand_mw REAL NOT NULL DEFAULT 0")
+        confirmation_cols = {row[1] for row in self.conn.execute("PRAGMA table_info(confirmations)")}
+        if "valid" not in confirmation_cols:
+            self.conn.execute("ALTER TABLE confirmations ADD COLUMN valid INTEGER NOT NULL DEFAULT 1")
 
     def audit(self, actor: str, action: str, entity_type: str, entity_id: object, details: dict) -> None:
         self.conn.execute("INSERT INTO audit_log(at,actor,action,entity_type,entity_id,details_json) VALUES(?,?,?,?,?,?)",
@@ -117,14 +145,43 @@ class GridService:
         except sqlite3.IntegrityError as exc: raise ApiError(409, "资产代号已存在") from exc
         return {"id": cur.lastrowid, "code": code, "name": name, "asset_type": asset_type, "capacity_mw": capacity_mw, "region": region, "parent_id": parent_id}
 
-    def register_facility(self, actor: str | None, role: str | None, name: str, facility_type: str, asset_id: int, priority: int, backup_power_mw: float) -> dict:
+    def register_facility(self, actor: str | None, role: str | None, name: str, facility_type: str, asset_id: int, priority: int, backup_power_mw: float, demand_mw: float = 0) -> dict:
         actor = self._actor(actor, role, {"dispatcher"})
         self._row("assets", asset_id)
-        if priority not in {1, 2, 3} or backup_power_mw < 0: raise ApiError(400, "重要用户参数不合法")
+        if priority not in {1, 2, 3} or backup_power_mw < 0 or demand_mw < 0: raise ApiError(400, "重要用户参数不合法")
         with self.conn:
-            cur = self.conn.execute("INSERT INTO facilities(name,facility_type,asset_id,priority,backup_power_mw) VALUES(?,?,?,?,?)", (name, facility_type, asset_id, priority, backup_power_mw))
+            cur = self.conn.execute("INSERT INTO facilities(name,facility_type,asset_id,priority,backup_power_mw,demand_mw) VALUES(?,?,?,?,?,?)", (name, facility_type, asset_id, priority, backup_power_mw, demand_mw))
             self.store.audit(actor, "facility.register", "facility", cur.lastrowid, {"name": name, "priority": priority})
-        return {"id": cur.lastrowid, "name": name, "facility_type": facility_type, "asset_id": asset_id, "priority": priority, "backup_power_mw": backup_power_mw}
+        return {"id": cur.lastrowid, "name": name, "facility_type": facility_type, "asset_id": asset_id, "priority": priority, "backup_power_mw": backup_power_mw, "demand_mw": demand_mw}
+
+    def update_facility_demand(self, actor: str | None, role: str | None, facility_id: int, demand_mw: float) -> dict:
+        actor = self._actor(actor, role, {"dispatcher"})
+        facility = self._row("facilities", int(facility_id))
+        try: demand_mw = float(demand_mw)
+        except (TypeError, ValueError) as exc: raise ApiError(400, "用电需求不合法") from exc
+        if demand_mw < 0: raise ApiError(400, "用电需求不能为负")
+        with self.conn:
+            self.conn.execute("UPDATE facilities SET demand_mw=? WHERE id=?", (demand_mw, facility["id"]))
+            invalidated = self._invalidate_confirmations(facility["id"], None)
+            self.store.audit(actor, "facility.demand_update", "facility", facility["id"], {"demand_mw": demand_mw, "invalidated_confirmations": invalidated})
+        return {"id": facility["id"], "name": facility["name"], "demand_mw": demand_mw, "invalidated_confirmations": invalidated}
+
+    def register_backup_check(self, actor: str | None, role: str | None, facility_id: int, outage_id: int, checked_at: str, sustain_minutes: int, valid_until: str | None = None) -> dict:
+        actor = self._actor(actor, role, {"dispatcher"})
+        facility = self._row("facilities", int(facility_id)); self._row("outages", int(outage_id))
+        checked_dt = parse_time(checked_at)
+        try: sustain = int(sustain_minutes)
+        except (TypeError, ValueError) as exc: raise ApiError(400, "可持续时长不合法") from exc
+        if sustain <= 0: raise ApiError(400, "可持续时长必须为正")
+        until_dt = parse_time(valid_until) if valid_until else checked_dt + timedelta(minutes=sustain)
+        if until_dt <= checked_dt: raise ApiError(400, "截止时间必须晚于检查时刻")
+        with self.conn:
+            cur = self.conn.execute("INSERT INTO backup_checks(facility_id,outage_id,checked_at,sustain_minutes,valid_until,recorded_by,created_at) VALUES(?,?,?,?,?,?,?)",
+                                    (facility["id"], int(outage_id), iso(checked_dt), sustain, iso(until_dt), actor, now()))
+            invalidated = self._invalidate_confirmations(facility["id"], int(outage_id))
+            self.store.audit(actor, "backup_check.register", "facility", facility["id"], {"outage_id": int(outage_id), "valid_until": iso(until_dt), "invalidated_confirmations": invalidated})
+        return {"id": cur.lastrowid, "facility_id": facility["id"], "outage_id": int(outage_id), "checked_at": iso(checked_dt),
+                "sustain_minutes": sustain, "valid_until": iso(until_dt), "invalidated_confirmations": invalidated}
 
     def create_outage(self, actor: str | None, role: str | None, incident_code: str, title: str, affected_regions: list[str]) -> dict:
         actor = self._actor(actor, role, {"dispatcher"})
@@ -222,7 +279,7 @@ class GridService:
         merge_status, conflict = "merged", None
         if plan["state"] != "active": merge_status, conflict = "conflict", "计划尚未激活"
         elif int(expected_plan_version) != int(plan["version"]): merge_status, conflict = "conflict", "现场报告基于旧计划版本"
-        elif self.conn.execute("SELECT id FROM confirmations WHERE plan_id=? AND step_no=?", (plan_id, step_no)).fetchone():
+        elif self.conn.execute("SELECT id FROM confirmations WHERE plan_id=? AND step_no=? AND valid=1", (plan_id, step_no)).fetchone():
             merge_status, conflict = "protected", "已确认记录不能由普通现场报告覆盖"
         with self.conn:
             cur = self.conn.execute("""INSERT INTO field_reports(client_report_id,plan_id,step_no,expected_plan_version,status,note,merge_status,conflict_reason,reported_by,received_at)
@@ -243,11 +300,16 @@ class GridService:
         if not report: raise ApiError(409, "没有可确认的现场报告")
         if decision == "confirmed" and report["status"] != "completed": raise ApiError(409, "现场步骤尚未完成")
         for dependency in steps[step_no].get("depends_on", []):
-            found = self.conn.execute("SELECT * FROM confirmations WHERE plan_id=? AND step_no=? AND status='confirmed'", (plan_id, int(dependency))).fetchone()
+            found = self.conn.execute("SELECT * FROM confirmations WHERE plan_id=? AND step_no=? AND status='confirmed' AND valid=1", (plan_id, int(dependency))).fetchone()
             if not found: raise ApiError(409, f"前置步骤 {dependency} 尚未确认")
+        if decision == "confirmed":
+            gaps = []
+            for verdict in self._step_backup_verdicts(plan, steps[step_no]):
+                gaps.extend(f"{verdict['facility_name']}：{reason}" for reason in verdict["reasons"])
+            if gaps: raise ApiError(409, "；".join(gaps))
         with self.conn:
-            self.conn.execute("""INSERT INTO confirmations(plan_id,step_no,status,confirmed_by,confirmed_at,note) VALUES(?,?,?,?,?,?)
-                               ON CONFLICT(plan_id,step_no) DO UPDATE SET status=excluded.status,confirmed_by=excluded.confirmed_by,confirmed_at=excluded.confirmed_at,note=excluded.note""",
+            self.conn.execute("""INSERT INTO confirmations(plan_id,step_no,status,confirmed_by,confirmed_at,note,valid) VALUES(?,?,?,?,?,?,1)
+                               ON CONFLICT(plan_id,step_no) DO UPDATE SET status=excluded.status,confirmed_by=excluded.confirmed_by,confirmed_at=excluded.confirmed_at,note=excluded.note,valid=1""",
                               (plan_id, step_no, decision, actor, now(), note))
             self.store.audit(actor, "plan.confirm_step", "plan", plan_id, {"step_no": step_no, "status": decision, "note": note})
         return dict(self.conn.execute("SELECT * FROM confirmations WHERE plan_id=? AND step_no=?", (plan_id, step_no)).fetchone())
@@ -258,7 +320,13 @@ class GridService:
         if plan["outage_id"] != outage_id: raise ApiError(400, "计划不属于该事故")
         confirmations = {row["step_no"]: dict(row) for row in self.conn.execute("SELECT * FROM confirmations WHERE plan_id=?", (plan_id,))}
         steps = json.loads(plan["steps_json"])
-        completed = sum(1 for step in steps if confirmations.get(int(step["seq"]), {}).get("status") == "confirmed")
+        completed = sum(1 for step in steps if self._confirmed(confirmations.get(int(step["seq"]))))
+        if completed == len(steps):
+            gaps = []
+            for facility in self._affected_facilities(outage):
+                verdict = self.backup_verdict(facility, outage_id)
+                if not verdict["ok"]: gaps.append(f"{facility['name']}：{'、'.join(verdict['reasons'])}")
+            if gaps: raise ApiError(409, "发布恢复完成前受影响用户需持有效备用电源检查：" + "；".join(gaps))
         status = {"outage_id": outage_id, "incident_code": outage["incident_code"], "plan_id": plan_id, "plan_version": plan["version"],
                   "state": "restored" if completed == len(steps) else "restoring", "completed_steps": completed, "total_steps": len(steps),
                   "critical_blocked": [x for x in confirmations.values() if x["status"] == "blocked"]}
@@ -299,8 +367,8 @@ class GridService:
             seq = int(step["seq"])
             if seq in confirmed:
                 old = confirmed[seq]
-                self.conn.execute("INSERT INTO confirmations(plan_id,step_no,status,confirmed_by,confirmed_at,note) VALUES(?,?,?,?,?,?)",
-                                  (new_plan_id, seq, old["status"], old["confirmed_by"], old["confirmed_at"], old["note"]))
+                self.conn.execute("INSERT INTO confirmations(plan_id,step_no,status,confirmed_by,confirmed_at,note,valid) VALUES(?,?,?,?,?,?,?)",
+                                  (new_plan_id, seq, old["status"], old["confirmed_by"], old["confirmed_at"], old["note"], old["valid"]))
 
     def _plan_update(self, plan: sqlite3.Row, state: str, expected_revision: int, actor: str, action: str, details: dict) -> None:
         if int(expected_revision) != int(plan["revision"]): raise ApiError(409, "计划版本冲突")
@@ -309,10 +377,84 @@ class GridService:
             if cur.rowcount != 1: raise ApiError(409, "并发计划更新冲突")
             self.store.audit(actor, action, "plan", plan["id"], details)
 
+    @staticmethod
+    def _confirmed(conf: dict | None) -> bool:
+        return bool(conf) and conf["status"] == "confirmed" and bool(conf["valid"])
+
+    def _invalidate_confirmations(self, facility_id: int, outage_id: int | None) -> int:
+        facility = self._row("facilities", facility_id)
+        asset = self._row("assets", int(facility["asset_id"]))
+        query, params = "SELECT * FROM plans WHERE state != 'superseded'", []
+        if outage_id is not None: query, params = query + " AND outage_id=?", [outage_id]
+        invalidated = 0
+        for plan in self.conn.execute(query, params):
+            for step in json.loads(plan["steps_json"]):
+                if step["asset"] == asset["code"]:
+                    invalidated += self.conn.execute("UPDATE confirmations SET valid=0 WHERE plan_id=? AND step_no=? AND valid=1",
+                                                     (plan["id"], int(step["seq"]))).rowcount
+        return invalidated
+
+    def _affected_facilities(self, outage: sqlite3.Row) -> list[sqlite3.Row]:
+        regions = json.loads(outage["affected_regions_json"])
+        marks = ",".join("?" for _ in regions)
+        return list(self.conn.execute(f"SELECT f.* FROM facilities f JOIN assets a ON a.id=f.asset_id WHERE f.connected=1 AND a.region IN ({marks}) ORDER BY f.priority,f.id", regions))
+
+    def _step_backup_verdicts(self, plan: sqlite3.Row, step: dict) -> list[dict]:
+        asset = self.conn.execute("SELECT * FROM assets WHERE code=?", (step["asset"],)).fetchone()
+        if not asset: return []
+        return [self.backup_verdict(facility, int(plan["outage_id"]))
+                for facility in self.conn.execute("SELECT * FROM facilities WHERE asset_id=? AND connected=1 ORDER BY priority,id", (asset["id"],))]
+
+    def backup_verdict(self, facility: sqlite3.Row, outage_id: int, at: datetime | None = None) -> dict:
+        moment = at or datetime.now(timezone.utc)
+        check = self.conn.execute("SELECT * FROM backup_checks WHERE facility_id=? AND outage_id=? ORDER BY id DESC LIMIT 1",
+                                  (facility["id"], outage_id)).fetchone()
+        margin = round(float(facility["backup_power_mw"]) - float(facility["demand_mw"]), 3)
+        codes, reasons = [], []
+        if check is None: codes.append("missing"); reasons.append("未登记备用电源检查")
+        elif parse_time(check["valid_until"]) <= moment: codes.append("expired"); reasons.append(f"备用电源检查已于 {check['valid_until']} 失效")
+        if margin < 0: codes.append("insufficient"); reasons.append(f"备用电源余量不足（余量 {margin}MW）")
+        return {"facility_id": facility["id"], "facility_name": facility["name"], "asset_id": facility["asset_id"],
+                "demand_mw": float(facility["demand_mw"]), "backup_power_mw": float(facility["backup_power_mw"]), "margin_mw": margin,
+                "ok": not codes, "codes": codes, "reasons": reasons, "check": dict(check) if check else None}
+
+    def outage_backup(self, outage_id: int) -> dict:
+        outage = self._row("outages", outage_id)
+        facilities = [self.backup_verdict(facility, outage_id) for facility in self._affected_facilities(outage)]
+        return {"outage_id": outage_id, "incident_code": outage["incident_code"], "all_ok": all(v["ok"] for v in facilities), "facilities": facilities}
+
+    def facility_checks(self, facility_id: int) -> dict:
+        facility = self._row("facilities", int(facility_id))
+        return {"facility_id": facility["id"],
+                "checks": [dict(row) for row in self.conn.execute("SELECT * FROM backup_checks WHERE facility_id=? ORDER BY id DESC", (facility["id"],))]}
+
     def plan_detail(self, plan_id: int) -> dict:
-        plan = self._plan_dict(self._row("plans", plan_id))
-        return {"plan": plan, "confirmations": [dict(row) for row in self.conn.execute("SELECT * FROM confirmations WHERE plan_id=? ORDER BY step_no", (plan_id,))],
-                "field_reports": [dict(row) for row in self.conn.execute("SELECT * FROM field_reports WHERE plan_id=? ORDER BY id", (plan_id,))]}
+        plan_row = self._row("plans", plan_id)
+        plan = self._plan_dict(plan_row)
+        outage = self._row("outages", plan["outage_id"])
+        confirmation_rows = [dict(row) for row in self.conn.execute("SELECT * FROM confirmations WHERE plan_id=? ORDER BY step_no", (plan_id,))]
+        confirmations = {row["step_no"]: row for row in confirmation_rows}
+        reports = [dict(row) for row in self.conn.execute("SELECT * FROM field_reports WHERE plan_id=? ORDER BY id", (plan_id,))]
+        merged = {}
+        for report in reports:
+            if report["merge_status"] == "merged": merged[report["step_no"]] = report
+        steps_view = []
+        for step in plan["steps"]:
+            seq = int(step["seq"])
+            conf, verdicts, reasons = confirmations.get(seq), self._step_backup_verdicts(plan_row, step), []
+            if conf and not conf["valid"]: reasons.append("确认已失效，需重新核验")
+            if not self._confirmed(conf):
+                report = merged.get(seq)
+                if not report: reasons.append("没有可确认的现场报告")
+                elif report["status"] == "blocked": reasons.append(f"现场缺口说明：{report['note'] or '无'}")
+                elif report["status"] != "completed": reasons.append("现场步骤尚未完成")
+                for dependency in step.get("depends_on", []):
+                    if not self._confirmed(confirmations.get(int(dependency))): reasons.append(f"前置步骤 {dependency} 尚未确认")
+                for verdict in verdicts:
+                    reasons.extend(f"{verdict['facility_name']}：{reason}" for reason in verdict["reasons"])
+            steps_view.append({**step, "confirmation": conf, "backup": verdicts, "blocked_reasons": reasons})
+        return {"plan": plan, "confirmations": confirmation_rows, "field_reports": reports, "steps": steps_view,
+                "affected_facilities": [self.backup_verdict(facility, outage["id"]) for facility in self._affected_facilities(outage)]}
 
     def _outage_dict(self, row: sqlite3.Row) -> dict:
         return {"id": row["id"], "incident_code": row["incident_code"], "title": row["title"], "state": row["state"],
@@ -355,6 +497,8 @@ class Handler(BaseHTTPRequestHandler):
             if p in (["health"], ["api", "health"]): out = {"status": "ok"}
             elif p == ["api", "state"]: out = self.service.state()
             elif len(p) == 3 and p[:2] == ["api", "plans"]: out = self.service.plan_detail(int(p[2]))
+            elif len(p) == 4 and p[:2] == ["api", "outages"] and p[3] == "backup": out = self.service.outage_backup(int(p[2]))
+            elif len(p) == 4 and p[:2] == ["api", "facilities"] and p[3] == "checks": out = self.service.facility_checks(int(p[2]))
             elif not p:
                 page = (Path(__file__).parent / "static" / "index.html").read_bytes(); self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8"); self.send_header("Content-Length", str(len(page))); self.end_headers(); self.wfile.write(page); return
             else: raise ApiError(404, "接口不存在")
@@ -366,7 +510,9 @@ class Handler(BaseHTTPRequestHandler):
         try:
             p, b = self._parts(), self._body(); actor, role = self.headers.get("X-Actor"), self.headers.get("X-Role")
             if p == ["api", "assets"]: out = self.service.register_asset(actor, role, b.get("code", ""), b.get("name", ""), b.get("asset_type", "line"), float(b.get("capacity_mw", 0)), b.get("region", ""), b.get("parent_id"))
-            elif p == ["api", "facilities"]: out = self.service.register_facility(actor, role, b.get("name", ""), b.get("facility_type", "hospital"), int(b.get("asset_id", 0)), int(b.get("priority", 1)), float(b.get("backup_power_mw", 0)))
+            elif p == ["api", "facilities"]: out = self.service.register_facility(actor, role, b.get("name", ""), b.get("facility_type", "hospital"), int(b.get("asset_id", 0)), int(b.get("priority", 1)), float(b.get("backup_power_mw", 0)), float(b.get("demand_mw", 0)))
+            elif len(p) == 4 and p[:2] == ["api", "facilities"] and p[3] == "demand": out = self.service.update_facility_demand(actor, role, int(p[2]), b.get("demand_mw", 0))
+            elif len(p) == 4 and p[:2] == ["api", "facilities"] and p[3] == "checks": out = self.service.register_backup_check(actor, role, int(p[2]), int(b.get("outage_id", 0)), b.get("checked_at", ""), b.get("sustain_minutes", 0), b.get("valid_until"))
             elif p == ["api", "outages"]: out = self.service.create_outage(actor, role, b.get("incident_code", ""), b.get("title", ""), b.get("affected_regions", []))
             elif p == ["api", "telemetry"]: out = self.service.record_telemetry(actor, role, int(b.get("asset_id", 0)), float(b.get("load_mw", 0)), float(b.get("voltage_kv", 0)), b.get("timestamp", ""))
             elif p == ["api", "plans"]: out = self.service.create_plan(actor, role, int(b.get("outage_id", 0)), b.get("steps", []))
